@@ -1,0 +1,98 @@
+name: Build GyatsoChess Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/android.yml'
+      - 'Gyatso/**'
+      - 'Makefile'
+      - 'nimble.*'
+      - 'Gyatso.nimble'
+      - 'compile.sh'
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    name: Android arm64-v8a (NEON)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm make unzip curl git
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.4'
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Install SIMD dependency
+        run: nimble install -y nimsimd
+
+      - name: Verify source and NNUE network
+        run: |
+          test -f Gyatso/src/main.nim
+          test -f Gyatso/Net/GyatsoNet512HM.bin || test -f Gyatso/Net/GyatsoNet1024.bin
+
+      - name: Build Android ARM64 NEON binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          NDK="$ANDROID_NDK_HOME"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          TARGET="aarch64-linux-android24"
+          CC="$TOOLCHAIN/bin/${TARGET}-clang"
+          SYSROOT="$TOOLCHAIN/sysroot"
+
+          # Select the embedded network shipped in this checkout.
+          if [[ -f Gyatso/Net/GyatsoNet1024.bin ]]; then
+            NET="Gyatso/Net/GyatsoNet1024.bin"
+          else
+            NET="Gyatso/Net/GyatsoNet512HM.bin"
+          fi
+
+          # Do not use -march=native, AVX2, or BMI2 when cross-compiling.
+          # AArch64 Android devices support Advanced SIMD (NEON) as part of the architecture.
+          nim c \
+            --os:linux --cpu:arm64 --cc:clang \
+            --mm:arc --opt:speed -d:release -d:danger -d:simd -d:neon \
+            --define:useMalloc --panics:on --styleCheck:hint \
+            --passC:"--target=${TARGET} --sysroot=${SYSROOT} -O3 -fPIC -march=armv8-a+simd -ffast-math -fstrict-aliasing -funroll-loops -fomit-frame-pointer" \
+            --passL:"--target=${TARGET} --sysroot=${SYSROOT} -fuse-ld=lld -Wl,-z,max-page-size=16384" \
+            --out:GyatsoChess-android-arm64 \
+            Gyatso/src/main.nim
+
+          file GyatsoChess-android-arm64 || true
+          "$TOOLCHAIN/bin/llvm-readelf" -h GyatsoChess-android-arm64 | grep -E 'Class:|Machine:'
+          mkdir -p dist
+          cp GyatsoChess-android-arm64 dist/GyatsoChess-android-arm64
+          cp "$NET" dist/ 2>/dev/null || true
+          (cd dist && sha256sum GyatsoChess-android-arm64 > SHA256SUMS.txt)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GyatsoChess-android-arm64-neon
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release asset on workflow_dispatch
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-build-${{ github.run_number }}
+          name: GyatsoChess Android ARM64 NEON build ${{ github.run_number }}
+          files: dist/*
+          fail_on_unmatched_files: true
