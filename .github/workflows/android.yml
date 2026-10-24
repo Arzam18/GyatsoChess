@@ -6,14 +6,12 @@ on:
   push:
     paths:
       - ".github/workflows/android.yml"
-      - "**/*.nim"
-      - "**/*.nims"
-      - "**/*.c"
-      - "**/*.h"
-      - "**/*.cpp"
-      - "**/*.nimble"
-      - "config.nims"
+      - "Gyatso/**"
+      - "Makefile"
+      - "compile.sh"
+      - "*.nimble"
       - "nim.cfg"
+      - "config.nims"
 
 permissions:
   contents: write
@@ -21,106 +19,153 @@ permissions:
 jobs:
   build:
     name: Build Android ARM64 NEON
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl unzip xz-utils build-essential
+          sudo apt-get install -y \
+            git-lfs \
+            curl \
+            build-essential \
+            file \
+            unzip \
+            xz-utils
+
+          git lfs install
+          git lfs pull
 
       - name: Install Nim
+        shell: bash
         run: |
-          curl https://nim-lang.org/choosenim/init.sh -sSf \
-            | sh -s -- -y
+          set -eux
+
+          curl -sSf https://nim-lang.org/choosenim/init.sh \
+            -o /tmp/choosenim-init.sh
+
+          sh /tmp/choosenim-init.sh -y
+
           echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
           "$HOME/.nimble/bin/choosenim" stable
 
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+
       - name: Install Android NDK
-        uses: nttld/setup-ndk@v1
         id: ndk
+        uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
           add-to-path: false
 
-      - name: Configure Android ARM64 toolchain
+      - name: Configure ARM64 Android toolchain
         shell: bash
         run: |
           set -eux
 
           NDK="${{ steps.ndk.outputs.ndk-path }}"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+          CC="$TOOLCHAIN/bin/aarch64-linux-android24-clang"
 
+          test -x "$CC"
+
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
-          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
-          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
-          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
-          echo "LD=$TOOLCHAIN/bin/ld.lld" >> "$GITHUB_ENV"
+          echo "ANDROID_CC=$CC" >> "$GITHUB_ENV"
 
-      - name: Check project files
-        run: |
-          echo "Repository files:"
-          ls -la
-          echo "Nim version:"
-          nim --version
-          echo "Android compiler:"
           "$CC" --version
 
-      - name: Build Android ARM64 NEON
+      - name: Verify source and NNUE network
         shell: bash
         run: |
           set -eux
 
-          # Find the Nim entry point.
-          if [ -f main.nim ]; then
-            ENTRY="main.nim"
-          elif [ -f src/main.nim ]; then
-            ENTRY="src/main.nim"
-          else
-            ENTRY="$(find . -maxdepth 3 -name '*.nim' \
-              ! -name '*.nimble' \
-              ! -path './.git/*' | head -n 1)"
-          fi
+          test -f Gyatso/src/main.nim
+          test -f Gyatso/Net/GyatsoNet512HM.bin
 
-          if [ -z "$ENTRY" ] || [ ! -f "$ENTRY" ]; then
-            echo "::error::Could not locate a Nim entry-point file."
+          NETWORK_SIZE=$(stat -c%s Gyatso/Net/GyatsoNet512HM.bin)
+
+          echo "NNUE network size: $NETWORK_SIZE bytes"
+
+          if [ "$NETWORK_SIZE" -lt 100000 ]; then
+            echo "::error::NNUE network is missing, incomplete, or unexpectedly small."
             exit 1
           fi
 
-          echo "Building entry point: $ENTRY"
+          echo "Nim version:"
+          nim --version
 
-          # Use Android's libc and compiler runtime, not Linux librt/libgcc.
-          # Nim's GCC backend invokes the NDK Clang compiler.
+      - name: Install SIMD dependency
+        run: |
+          nimble install -y nimsimd
+
+      - name: Compile GyatsoChess
+        shell: bash
+        run: |
+          set -eux
+
+          CC="$ANDROID_CC"
+
           nim c \
             --os:android \
             --cpu:arm64 \
-            --cc:gcc \
-            --gcc.exe:"$CC" \
-            --gcc.linkerexe:"$CC" \
-            --passC:"-march=armv8-a+simd" \
-            --passC:"-mtune=generic" \
-            --passL:"-fPIE" \
+            --cc:clang \
+            --clang.exe:"$CC" \
+            --clang.linkerexe:"$CC" \
+            --mm:arc \
+            --define:useMalloc \
+            -d:release \
+            -d:danger \
+            -d:simd \
+            -d:neon \
+            --opt:speed \
+            --panics:on \
+            --passC:"-O3 -march=armv8-a+simd -ffast-math -fstrict-aliasing -funroll-loops -fomit-frame-pointer" \
             --passL:"-pie" \
-            --passL:"-Wl,--allow-shlib-undefined" \
-            --out:GyatsoChess-android-arm64 \
-            "$ENTRY"
+            --out:GyatsoChess-android-arm64-neon \
+            Gyatso/src/main.nim
 
-          file GyatsoChess-android-arm64
+      - name: Verify Android executable
+        shell: bash
+        run: |
+          set -eux
 
-      - name: Upload Android binary
+          BINARY="GyatsoChess-android-arm64-neon"
+          test -s "$BINARY"
+
+          file "$BINARY"
+
+          "$ANDROID_TOOLCHAIN/bin/llvm-readelf" -h "$BINARY"
+
+          SIZE=$(stat -c%s "$BINARY")
+          echo "Binary size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 100000 ]; then
+            echo "::error::Binary is unexpectedly small; verify NNUE embedding."
+            exit 1
+          fi
+
+          HEADER=$("$ANDROID_TOOLCHAIN/bin/llvm-readelf" -h "$BINARY")
+
+          echo "$HEADER" | grep -q 'AArch64'
+          echo "$HEADER" | grep -q 'DYN'
+
+      - name: Upload Android ARM64 NEON artifact
         uses: actions/upload-artifact@v4
         with:
           name: GyatsoChess-android-arm64-neon
-          path: GyatsoChess-android-arm64
+          path: GyatsoChess-android-arm64-neon
           if-no-files-found: error
+          retention-days: 30
 
-      - name: Publish GitHub release asset
+      - name: Publish release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: GyatsoChess-android-arm64
+          files: GyatsoChess-android-arm64-neon
