@@ -1,98 +1,126 @@
+
 name: Build GyatsoChess Android ARM64 NEON
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/android.yml'
-      - 'Gyatso/**'
-      - 'Makefile'
-      - 'nimble.*'
-      - 'Gyatso.nimble'
-      - 'compile.sh'
+      - ".github/workflows/android.yml"
+      - "**/*.nim"
+      - "**/*.nims"
+      - "**/*.c"
+      - "**/*.h"
+      - "**/*.cpp"
+      - "**/*.nimble"
+      - "config.nims"
+      - "nim.cfg"
 
 permissions:
   contents: write
 
 jobs:
-  build-android:
-    name: Android arm64-v8a (NEON)
-    runs-on: ubuntu-24.04
+  build:
+    name: Build Android ARM64 NEON
+    runs-on: ubuntu-latest
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Install host build tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm make unzip curl git
+          sudo apt-get install -y git curl unzip xz-utils build-essential
 
       - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: '2.2.4'
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf \
+            | sh -s -- -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+          "$HOME/.nimble/bin/choosenim" stable
 
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
+        id: ndk
         with:
           ndk-version: r27c
+          add-to-path: false
 
-      - name: Install SIMD dependency
-        run: nimble install -y nimsimd
-
-      - name: Verify source and NNUE network
-        run: |
-          test -f Gyatso/src/main.nim
-          test -f Gyatso/Net/GyatsoNet512HM.bin || test -f Gyatso/Net/GyatsoNet1024.bin
-
-      - name: Build Android ARM64 NEON binary
+      - name: Configure Android ARM64 toolchain
         shell: bash
         run: |
-          set -euxo pipefail
-          NDK="$ANDROID_NDK_HOME"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-          TARGET="aarch64-linux-android24"
-          CC="$TOOLCHAIN/bin/${TARGET}-clang"
-          SYSROOT="$TOOLCHAIN/sysroot"
+          set -eux
 
-          # Select the embedded network shipped in this checkout.
-          if [[ -f Gyatso/Net/GyatsoNet1024.bin ]]; then
-            NET="Gyatso/Net/GyatsoNet1024.bin"
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "LD=$TOOLCHAIN/bin/ld.lld" >> "$GITHUB_ENV"
+
+      - name: Check project files
+        run: |
+          echo "Repository files:"
+          ls -la
+          echo "Nim version:"
+          nim --version
+          echo "Android compiler:"
+          "$CC" --version
+
+      - name: Build Android ARM64 NEON
+        shell: bash
+        run: |
+          set -eux
+
+          # Find the Nim entry point.
+          if [ -f main.nim ]; then
+            ENTRY="main.nim"
+          elif [ -f src/main.nim ]; then
+            ENTRY="src/main.nim"
           else
-            NET="Gyatso/Net/GyatsoNet512HM.bin"
+            ENTRY="$(find . -maxdepth 3 -name '*.nim' \
+              ! -name '*.nimble' \
+              ! -path './.git/*' | head -n 1)"
           fi
 
-          # Do not use -march=native, AVX2, or BMI2 when cross-compiling.
-          # AArch64 Android devices support Advanced SIMD (NEON) as part of the architecture.
+          if [ -z "$ENTRY" ] || [ ! -f "$ENTRY" ]; then
+            echo "::error::Could not locate a Nim entry-point file."
+            exit 1
+          fi
+
+          echo "Building entry point: $ENTRY"
+
+          # Use Android's libc and compiler runtime, not Linux librt/libgcc.
+          # Nim's GCC backend invokes the NDK Clang compiler.
           nim c \
-            --os:linux --cpu:arm64 --cc:clang \
-            --mm:arc --opt:speed -d:release -d:danger -d:simd -d:neon \
-            --define:useMalloc --panics:on --styleCheck:hint \
-            --passC:"--target=${TARGET} --sysroot=${SYSROOT} -O3 -fPIC -march=armv8-a+simd -ffast-math -fstrict-aliasing -funroll-loops -fomit-frame-pointer" \
-            --passL:"--target=${TARGET} --sysroot=${SYSROOT} -fuse-ld=lld -Wl,-z,max-page-size=16384" \
+            --os:android \
+            --cpu:arm64 \
+            --cc:gcc \
+            --gcc.exe:"$CC" \
+            --gcc.linkerexe:"$CC" \
+            --passC:"-march=armv8-a+simd" \
+            --passC:"-mtune=generic" \
+            --passL:"-fPIE" \
+            --passL:"-pie" \
+            --passL:"-Wl,--allow-shlib-undefined" \
             --out:GyatsoChess-android-arm64 \
-            Gyatso/src/main.nim
+            "$ENTRY"
 
-          file GyatsoChess-android-arm64 || true
-          "$TOOLCHAIN/bin/llvm-readelf" -h GyatsoChess-android-arm64 | grep -E 'Class:|Machine:'
-          mkdir -p dist
-          cp GyatsoChess-android-arm64 dist/GyatsoChess-android-arm64
-          cp "$NET" dist/ 2>/dev/null || true
-          (cd dist && sha256sum GyatsoChess-android-arm64 > SHA256SUMS.txt)
+          file GyatsoChess-android-arm64
 
-      - name: Upload build artifact
+      - name: Upload Android binary
         uses: actions/upload-artifact@v4
         with:
           name: GyatsoChess-android-arm64-neon
-          path: dist/*
+          path: GyatsoChess-android-arm64
           if-no-files-found: error
-          retention-days: 30
 
-      - name: Publish release asset on workflow_dispatch
-        if: github.event_name == 'workflow_dispatch'
+      - name: Publish GitHub release asset
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: android-build-${{ github.run_number }}
-          name: GyatsoChess Android ARM64 NEON build ${{ github.run_number }}
-          files: dist/*
-          fail_on_unmatched_files: true
+          files: GyatsoChess-android-arm64
